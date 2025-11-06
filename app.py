@@ -13,6 +13,61 @@ def _sector_samples_key(sector):
 
 MIN_SAMPLES_FOR_MEDIAN = 1  # mismo umbral que en progress.py
 
+# ==== NUEVO: claves y parámetros para ETA multi-sector ====
+def _job_pending_key(job_id): 
+    return f"job:{job_id}:pending_by_sector"   # HASH: sector -> pendientes
+def _job_eta_key(job_id):
+    return f"job:{job_id}:eta"                 # HASH: prev_eta, prev_ts, eta_display
+
+DEFAULT_RATE_SEC_PER_UNIT = int(os.getenv("DEFAULT_RATE_SEC_PER_UNIT", "45"))  # fallback conservador
+SAMPLES_CAP = int(os.getenv("SAMPLES_CAP", "200"))  # por si quieres alinear con progress.py
+ALPHA = float(os.getenv("ETA_SMOOTHING_ALPHA", "0.30"))  # suavizado exponencial
+
+def eta_sum_by_sector_from_redis(job_id: str):
+    """
+    Suma por sector: Σ (pendientes_sector * mediana_histórica_sector),
+    usando DEFAULT_RATE_SEC_PER_UNIT si falta histórico.
+    Devuelve (raw_eta_seconds, dict_by_sector)
+    """
+    hk = _job_pending_key(job_id)
+    items = r.hgetall(hk) or {}
+    total = 0.0
+    for sector, n_left in items.items():
+        try:
+            n = max(int(n_left), 0)
+        except Exception:
+            n = 0
+        if n == 0:
+            continue
+        med, _n = get_sector_median(sector)
+        rate = float(med) if med is not None else float(DEFAULT_RATE_SEC_PER_UNIT)
+        total += n * max(rate, 0.001)
+    return float(total), items
+
+def monotonic_smoothed_eta(job_id: str, raw_eta_seconds: float):
+    """
+    Aplica clamp NO-creciente + suavizado exponencial al ETA mostrado.
+    Permite subidas solo si realmente crece raw_eta (p.ej., aumentan pendientes).
+    """
+    now = int(time.time())
+    ek = _job_eta_key(job_id)
+    prev = r.hgetall(ek) or {}
+    prev_eta = float(prev.get("prev_eta", raw_eta_seconds))
+    prev_ts  = float(prev.get("prev_ts", now))
+    disp_prev = float(prev.get("eta_display", raw_eta_seconds))
+
+    elapsed = max(now - prev_ts, 0.0)
+    monotonic = max(float(raw_eta_seconds), prev_eta - elapsed)  # no crece "gratis"
+    eta_display = ALPHA * monotonic + (1.0 - ALPHA) * disp_prev
+
+    r.hset(ek, mapping={
+        "prev_eta": monotonic,
+        "prev_ts": now,
+        "eta_display": eta_display
+    })
+    return float(eta_display)
+# ==== FIN NUEVO ====
+
 def get_sector_median(sector):
     """
     Lee la LIST stats:sector:<sector>:samples y devuelve (mediana, n_muestras),
