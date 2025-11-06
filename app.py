@@ -24,6 +24,13 @@ def get_sector_median(sector):
     nums = list(map(int, vals))
     return int(statistics.median(nums)), len(nums)
 
+def get_units(job_id):
+    """Lee total y hechas del job en Redis."""
+    d = r.hgetall(_key(job_id)) or {}
+    tot  = int(d.get("total_units", "0") or 0)
+    done = int(d.get("done_units", "0") or 0)
+    return tot, done
+
 HTML = """
 <!doctype html><meta charset="utf-8">
 <title>Progress {{job_id}}</title>
