@@ -172,67 +172,51 @@ def status(job_id):
     msg = data.get("msg", "")
     now = int(time.time())
 
-    # ---------- ETA por UNIDADES (estable) + suavizado ----------
+    # ---------- NUEVO: ETA multi-sector con clamp + suavizado ----------
     eta_seconds = None
     try:
         if state in ("running", "queued"):
-            # Lee unidades (total, hechas) que el worker guardó
-            try:
-                tot, done = get_units(job_id)
-            except Exception:
-                tot = int(data.get("total_units", "0") or 0)
-                done = int(data.get("done_units", "0") or 0)
-
-            remaining = max(0, tot - done)
-
-            # Priors de tiempo
-            sector = data.get("current_sector")
-            sector_med = None
-            if sector:
-                try:
-                    sector_med, _n = get_sector_median(sector)
-                except Exception:
-                    sector_med = None
-
-            GLOBAL_PRIOR = int(os.getenv("GLOBAL_SECTOR_PRIOR_SEC", "35"))  # ajusta si quieres
-
-            # Estimación base por unidad
-            if state == "running":
-                per_unit = sector_med or GLOBAL_PRIOR
+            # 1) Intentar suma por sector (requiere que el worker haya escrito job:{job}:pending_by_sector)
+            raw_eta, by_sector = eta_sum_by_sector_from_redis(job_id)
+    
+            if by_sector:  # tenemos desglose por sector -> cálculo robusto
+                eta_seconds = monotonic_smoothed_eta(job_id, raw_eta)
             else:
-                per_unit = GLOBAL_PRIOR
-
-            raw_eta = remaining * per_unit
-
-            # Fallback si aún no hay unidades configuradas
-            if tot == 0 and done == 0:
-                started_at = int(data.get("started_at", "0") or 0)
-                pct_val = int(float(data.get("pct", 0)))
-                if started_at > 0 and pct_val > 0:
-                    elapsed = max(1, now - started_at)
-                    # clamp para evitar explosiones por pct pequeño
-                    raw_eta = min(3*3600, int(elapsed * (100 - pct_val) / pct_val))
-
-            # Suavizado + límites de cambio ±20%
-            prev_eta = data.get("prev_eta")
-            if prev_eta is not None:
+                # 2) Fallback (legacy): si aún no existe pending_by_sector, usar unidades restantes × prior
                 try:
-                    prev_eta = int(prev_eta)
-                    alpha = 0.3  # 30% nuevo + 70% anterior
-                    smoothed = int(alpha * raw_eta + (1 - alpha) * prev_eta)
-                    cap_up   = int(prev_eta * 1.20)
-                    cap_down = int(prev_eta * 0.80)
-                    eta_seconds = max(cap_down, min(cap_up, smoothed))
+                    tot, done = get_units(job_id)
                 except Exception:
-                    eta_seconds = raw_eta
-            else:
-                eta_seconds = raw_eta
-
-            # Guarda para el siguiente tick
-            r.hset(_key(job_id), mapping={"prev_eta": int(eta_seconds), "updated_at": now})
-
+                    d = r.hgetall(_key(job_id)) or {}
+                    tot = int(d.get("total_units", "0") or 0)
+                    done = int(d.get("done_units", "0") or 0)
+    
+                remaining = max(0, tot - done)
+    
+                # Si existe sector actual y su mediana, úsala; si no, prior global
+                data_for_job = r.hgetall(_key(job_id)) or {}
+                cur_sector = data_for_job.get("current_sector")
+                sector_med = None
+                if cur_sector:
+                    try:
+                        sector_med, _n = get_sector_median(cur_sector)
+                    except Exception:
+                        sector_med = None
+    
+                per_unit = (sector_med or DEFAULT_RATE_SEC_PER_UNIT)
+                raw_eta = remaining * per_unit
+    
+                # Si no hay unidades pero hay progreso, usa regla por pct (clamp)
+                now_sec = int(time.time())
+                started_at = int(data_for_job.get("started_at", "0") or 0)
+                pct_val = int(float(data_for_job.get("pct", 0)))
+                if tot == 0 and done == 0 and started_at > 0 and pct_val > 0:
+                    elapsed = max(1, now_sec - started_at)
+                    raw_eta = min(3*3600, int(elapsed * (100 - pct_val) / max(1, pct_val)))
+    
+                eta_seconds = monotonic_smoothed_eta(job_id, float(raw_eta))
     except Exception:
         eta_seconds = None
+    # ---------- FIN NUEVO ----------
 
     return jsonify({
         "job_id": job_id,
