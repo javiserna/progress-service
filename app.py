@@ -231,5 +231,41 @@ def progress_page(job_id):
     token = request.args.get("t","")
     return render_template_string(HTML, job_id=job_id, token=token)
 
+@app.get("/api/sector-times")
+def api_sector_times():
+    """
+    Devuelve todos los sectores y sus tiempos registrados (samples en segundos).
+    Es completamente público (sin token).
+    Ejemplo:
+      https://progress.tessextractor.app/api/sector-times
+    """
+    # Buscar todos los sectores con samples guardados
+    sectors = set()
+    for key in r.scan_iter("stats:sector:*:samples"):
+        parts = key.split(":")
+        if len(parts) >= 3:
+            sectors.add(parts[2])
+    sectors = sorted(sectors, key=lambda s: (not s.isdigit(), int(s) if s.isdigit() else s))
+
+    out = []
+    for s in sectors:
+        vals = r.lrange(f"stats:sector:{s}:samples", 0, -1)
+        times = [int(v) for v in vals]
+        median = None
+        try:
+            import statistics
+            if times:
+                median = int(statistics.median(times))
+        except Exception:
+            pass
+        out.append({
+            "sector": s,
+            "n_samples": len(times),
+            "median_sec_per_unit": median,
+            "samples_sec": times
+        })
+
+    return jsonify({"sectors": out})
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
