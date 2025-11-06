@@ -1,5 +1,6 @@
 import os, redis, time
 from flask import Flask, jsonify, render_template_string, request
+from progress import get_sector_median
 
 app = Flask(__name__)
 
