@@ -1,12 +1,27 @@
 import os, redis, time
-from flask import Flask, jsonify, render_template_string, request
-from progress import get_sector_median
+from flask import Flask, jsonify, render_template_string, request, statistics
 
 app = Flask(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", os.getenv("REDIS_PUBLIC_URL", "redis://localhost:6379/0"))
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 def _key(job_id): return f"job:{job_id}"
+
+def _sector_samples_key(sector): 
+    return f"stats:sector:{sector}:samples"
+
+MIN_SAMPLES_FOR_MEDIAN = 1  # mismo umbral que en progress.py
+
+def get_sector_median(sector):
+    """
+    Lee la LIST stats:sector:<sector>:samples y devuelve (mediana, n_muestras),
+    o (None, 0) si aún no hay suficientes datos.
+    """
+    vals = r.lrange(_sector_samples_key(sector), 0, -1)
+    if not vals or len(vals) < MIN_SAMPLES_FOR_MEDIAN:
+        return None, len(vals or [])
+    nums = list(map(int, vals))
+    return int(statistics.median(nums)), len(nums)
 
 HTML = """
 <!doctype html><meta charset="utf-8">
