@@ -117,35 +117,65 @@ def status(job_id):
     msg = data.get("msg", "")
     now = int(time.time())
 
-    # ---------- ETA con mediana por sector (estable) + fallback ----------
+    # ---------- ETA por UNIDADES (estable) + suavizado ----------
     eta_seconds = None
     try:
-        if state == "running":
-            # 1) Intento: usar mediana histórica por sector
+        if state in ("running", "queued"):
+            # Lee unidades (total, hechas) que el worker guardó
+            try:
+                tot, done = get_units(job_id)
+            except Exception:
+                tot = int(data.get("total_units", "0") or 0)
+                done = int(data.get("done_units", "0") or 0)
+
+            remaining = max(0, tot - done)
+
+            # Priors de tiempo
             sector = data.get("current_sector")
-            median_sec = None
+            sector_med = None
             if sector:
                 try:
-                    median_sec, _n = get_sector_median(sector)  # devuelve (mediana, n_muestras) o (None, 0)
+                    sector_med, _n = get_sector_median(sector)
                 except Exception:
-                    median_sec = None
+                    sector_med = None
 
-            if median_sec is not None and pct > 0:
-                # ETA estable con mediana por sector
-                eta_seconds = int(median_sec * (100 - pct) / pct)
+            GLOBAL_PRIOR = int(os.getenv("GLOBAL_SECTOR_PRIOR_SEC", "35"))  # ajusta si quieres
+
+            # Estimación base por unidad
+            if state == "running":
+                per_unit = sector_med or GLOBAL_PRIOR
             else:
-                # 2) Fallback: ETA clásico por elapsed
-                started_at = int(data.get("started_at", "0") or "0")
-                if started_at > 0 and pct > 0:
-                    elapsed = max(1, now - started_at)
-                    eta_seconds = int(elapsed * (100 - pct) / pct)
+                per_unit = GLOBAL_PRIOR
 
-        elif state == "queued":
-            # Si mantienes una cola y un promedio por job, úsalo aquí
-            avg_job_seconds = int(data.get("avg_job_seconds", "0") or "0")
-            queue_pos = r.zrank("queue", job_id)  # requiere que mantengas ZADD/ZREM en tu worker
-            if avg_job_seconds and queue_pos is not None:
-                eta_seconds = int(avg_job_seconds * (queue_pos + 1))
+            raw_eta = remaining * per_unit
+
+            # Fallback si aún no hay unidades configuradas
+            if tot == 0 and done == 0:
+                started_at = int(data.get("started_at", "0") or 0)
+                pct_val = int(float(data.get("pct", 0)))
+                if started_at > 0 and pct_val > 0:
+                    elapsed = max(1, now - started_at)
+                    # clamp para evitar explosiones por pct pequeño
+                    raw_eta = min(3*3600, int(elapsed * (100 - pct_val) / pct_val))
+
+            # Suavizado + límites de cambio ±20%
+            prev_eta = data.get("prev_eta")
+            if prev_eta is not None:
+                try:
+                    prev_eta = int(prev_eta)
+                    alpha = 0.3  # 30% nuevo + 70% anterior
+                    smoothed = int(alpha * raw_eta + (1 - alpha) * prev_eta)
+                    cap_up   = int(prev_eta * 1.20)
+                    cap_down = int(prev_eta * 0.80)
+                    eta_seconds = max(cap_down, min(cap_up, smoothed))
+                except Exception:
+                    eta_seconds = raw_eta
+            else:
+                eta_seconds = raw_eta
+
+            # Guarda para el siguiente tick
+            r.hset(_key(job_id), mapping={"prev_eta": int(eta_seconds), "updated_at": now})
+
     except Exception:
         eta_seconds = None
 
