@@ -1,5 +1,6 @@
 import os, redis, time
-from flask import Flask, jsonify, render_template_string, request, statistics
+from flask import Flask, jsonify, render_template_string, request
+import statistics
 
 app = Flask(__name__)
 
