@@ -1,28 +1,78 @@
-import os, redis
+import os, redis, time
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-# Usa la URL pública de tu Redis de Railway
 REDIS_URL = os.getenv("REDIS_URL", os.getenv("REDIS_PUBLIC_URL", "redis://localhost:6379/0"))
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-
 def _key(job_id): return f"job:{job_id}"
 
 HTML = """
 <!doctype html><meta charset="utf-8">
-<title>Progreso {{job_id}}</title>
-<h2 style="font-family:system-ui;margin:0 0 8px;">Job {{job_id}}</h2>
-<div id="pct" style="font-size:2.2rem;font-family:system-ui;">0%</div>
-<div id="msg" style="margin-top:6px;color:#555;font-family:system-ui;"></div>
+<title>Progress {{job_id}}</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin:24px; color:#111;}
+  h2{margin:0 0 12px;}
+  .pct{font-size:3rem; font-weight:700; margin:8px 0;}
+  .bar{width:100%; height:14px; background:#eee; border-radius:999px; overflow:hidden;}
+  .fill{height:100%; width:0%; background:#0a7; transition:width .6s;}
+  .row{margin-top:10px; color:#555;}
+  .badge{display:inline-block; padding:2px 8px; border-radius:999px; background:#eef; margin-right:8px; font-size:.9rem;}
+  .ok{background:#e6f8ef;}
+  .err{background:#fdecec;}
+  .muted{color:#666;}
+</style>
+<h2>Job {{job_id}}</h2>
+<div class="pct" id="pct">0%</div>
+<div class="bar"><div class="fill" id="fill"></div></div>
+<div class="row">
+  <span class="badge" id="state">queued</span>
+  <span id="msg" class="muted"></span>
+</div>
+<div class="row" id="etaRow" style="display:none;">
+  ⏱ <span id="etaText" class="muted"></span>
+</div>
+
 <script>
+function fmtSeconds(s){
+  if (s == null || isNaN(s) || s < 0) return "";
+  const m = Math.floor(s/60), sec = Math.round(s%60);
+  if (m >= 60) {
+    const h = Math.floor(m/60), mm = m%60;
+    return h + "h " + (mm>0? mm+"m ":"") + (sec>0? sec+"s":"");
+  }
+  return (m>0? m+"m ":"") + (sec>0? sec+"s":"");
+}
+
 async function tick(){
   const res = await fetch("/status/{{job_id}}?t={{token}}");
   if (!res.ok) return;
   const j = await res.json();
-  document.getElementById('pct').textContent = (j.pct ?? 0) + "%";
-  document.getElementById('msg').textContent = j.estado + (j.msg ? (" — " + j.msg) : "");
-  if (j.estado === "done" || j.estado === "error"){ clearInterval(iv); }
+
+  const pct = (j.pct ?? 0);
+  document.getElementById('pct').textContent = pct + "%";
+  document.getElementById('fill').style.width = pct + "%";
+
+  const st = j.state || j.estado || "unknown"; // fallback
+  const msg = j.msg || "";
+  const stEl = document.getElementById('state');
+  stEl.textContent = st;
+  stEl.className = "badge " + (st==="done"?"ok":(st==="error"?"err":""));
+
+  document.getElementById('msg').textContent = msg;
+
+  // ETA (servidor pre-calcula j.eta_seconds si puede)
+  const etaRow = document.getElementById('etaRow');
+  const etaText = document.getElementById('etaText');
+  if (j.eta_seconds != null && (st==="running" || st==="queued")){
+    etaRow.style.display = "block";
+    etaText.textContent = (st==="queued" ? "Estimated queue wait: " : "Estimated time remaining: ") + fmtSeconds(j.eta_seconds);
+  } else {
+    etaRow.style.display = "none";
+    etaText.textContent = "";
+  }
+
+  if (st === "done" || st === "error"){ clearInterval(iv); }
 }
 const iv = setInterval(tick, 1500);
 tick();
@@ -36,11 +86,37 @@ def status(job_id):
     if saved_token and token != saved_token:
         return jsonify({"error":"unauthorized"}), 401
     data = r.hgetall(_key(job_id)) or {}
+
+    # Map fields + compute ETA
+    pct = int(float(data.get("pct", 0)))
+    state = data.get("state") or data.get("estado") or "unknown"
+    msg = data.get("msg", "")
+    now = int(time.time())
+
+    # ETA cuando está corriendo: eta = elapsed * (100 - pct) / pct
+    eta_seconds = None
+    try:
+        if state == "running" and pct > 0:
+            started_at = int(data.get("started_at", "0") or "0")
+            if started_at > 0:
+                elapsed = max(1, now - started_at)
+                eta_seconds = int(elapsed * (100 - pct) / pct)
+        # ETA cuando está en cola: posición * promedio por job (si hay métrica guardada)
+        elif state == "queued":
+            # si guardas avg_job_seconds en Redis:
+            avg_job_seconds = int(data.get("avg_job_seconds", "0") or "0")
+            queue_pos = r.zrank("queue", job_id)  # requiere mantener un sorted set "queue"
+            if avg_job_seconds and queue_pos is not None:
+                eta_seconds = int(avg_job_seconds * (queue_pos + 1))
+    except Exception:
+        eta_seconds = None
+
     return jsonify({
         "job_id": job_id,
-        "pct": int(float(data.get("pct", 0))),
-        "estado": data.get("estado","unknown"),
-        "msg": data.get("msg","")
+        "pct": pct,
+        "state": state,
+        "msg": msg,
+        "eta_seconds": eta_seconds
     })
 
 @app.get("/progress/<job_id>")
