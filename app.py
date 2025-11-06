@@ -94,19 +94,33 @@ def status(job_id):
     msg = data.get("msg", "")
     now = int(time.time())
 
-    # ETA cuando está corriendo: eta = elapsed * (100 - pct) / pct
+    # ---------- ETA con mediana por sector (estable) + fallback ----------
     eta_seconds = None
     try:
-        if state == "running" and pct > 0:
-            started_at = int(data.get("started_at", "0") or "0")
-            if started_at > 0:
-                elapsed = max(1, now - started_at)
-                eta_seconds = int(elapsed * (100 - pct) / pct)
-        # ETA cuando está en cola: posición * promedio por job (si hay métrica guardada)
+        if state == "running":
+            # 1) Intento: usar mediana histórica por sector
+            sector = data.get("current_sector")
+            median_sec = None
+            if sector:
+                try:
+                    median_sec, _n = get_sector_median(sector)  # devuelve (mediana, n_muestras) o (None, 0)
+                except Exception:
+                    median_sec = None
+
+            if median_sec is not None and pct > 0:
+                # ETA estable con mediana por sector
+                eta_seconds = int(median_sec * (100 - pct) / pct)
+            else:
+                # 2) Fallback: ETA clásico por elapsed
+                started_at = int(data.get("started_at", "0") or "0")
+                if started_at > 0 and pct > 0:
+                    elapsed = max(1, now - started_at)
+                    eta_seconds = int(elapsed * (100 - pct) / pct)
+
         elif state == "queued":
-            # si guardas avg_job_seconds en Redis:
+            # Si mantienes una cola y un promedio por job, úsalo aquí
             avg_job_seconds = int(data.get("avg_job_seconds", "0") or "0")
-            queue_pos = r.zrank("queue", job_id)  # requiere mantener un sorted set "queue"
+            queue_pos = r.zrank("queue", job_id)  # requiere que mantengas ZADD/ZREM en tu worker
             if avg_job_seconds and queue_pos is not None:
                 eta_seconds = int(avg_job_seconds * (queue_pos + 1))
     except Exception:
